@@ -3,6 +3,157 @@ from __future__ import annotations
 
 from typing import Any
 
+def _build_energy_rows() -> list[dict[str, Any]]:
+    """能耗抄表流水：按设备 + 班次堆放的原始记录。
+
+    刻意保留几类脏数据，供钻取视图验证口径：
+    - 同一台设备同一班次重复提交（靠「提交时间」保留最新一条）；
+    - 抄表人员 / 记录时段缺失；
+    - 整班漏抄（根本没有记录，汇总按空白而不是 0）；
+    - 抄了表但数值留空；
+    - 7、8 月的历史记录，用来区分周 / 月 / 季度账期。
+    """
+    readers = ["张建国", "李文斌", "王海涛", "赵晓燕"]
+    days = ["2026-09-28", "2026-09-29", "2026-09-30"]
+    shifts = ["夜班", "白班", "晚班"]
+    submit_hm = {"夜班": "06:50", "白班": "15:00", "晚班": "23:10"}
+
+    qc = [f"QC-10{i}" for i in range(1, 6)]
+    rtg = [f"RTG-20{i}" for i in range(1, 9)]
+    trk = [f"TRK-30{i}" for i in range(1, 6)]
+    rcp = [f"RCP-40{i}" for i in range(1, 3)]
+
+    qc_elec = {
+        "夜班": [980, 1050, 900, 1120, 870],
+        "白班": [1720, 1800, 1650, 1980, 1760],
+        "晚班": [1680, 1750, 1600, 1900, 1700],
+    }
+    rtg_elec = {
+        "夜班": [520, 560, 610, 500, 580, 640, 470, 600],
+        "白班": [720, 760, 800, 690, 740, 820, 680, 770],
+        "晚班": [690, 730, 780, 650, 710, 800, 640, 750],
+    }
+    rtg_fuel = {
+        "夜班": [120, 130, 140, 110, 135, 150, 105, 125],
+        "白班": [160, 170, 180, 150, 165, 190, 145, 175],
+        "晚班": [150, 160, 170, 140, 158, 185, 138, 168],
+    }
+    trk_fuel = {
+        "夜班": [75, 82, 70, 88, 78],
+        "白班": [118, 125, 110, 132, 120],
+        "晚班": [108, 115, 100, 122, 112],
+    }
+    rcp_elec = {
+        "夜班": [95, 100],
+        "白班": [150, 158],
+        "晚班": [135, 142],
+    }
+
+    rows: list[dict[str, Any]] = []
+    seq = 0
+
+    def add(
+        cat: str,
+        dev: str,
+        period: str,
+        elec: int | None,
+        fuel: int | None,
+        reader: str | None,
+        submit_day: str,
+        hm: str,
+        status: str = "正常",
+        code: str | None = None,
+    ) -> None:
+        nonlocal seq
+        seq += 1
+        rows.append({
+            "id": seq,
+            "status": status,
+            "pending": status != "已核实",
+            "abnormal": status == "异常偏高",
+            "记录编号": code or f"ENER-{seq:04d}",
+            "设备类型": cat,
+            "设备编号": dev,
+            "电耗度数": "" if elec is None else elec,
+            "油耗升数": "" if fuel is None else fuel,
+            "记录时段": period,
+            "抄表人员": "" if reader is None else reader,
+            "能耗状态": status,
+            "提交时间": f"{submit_day} {hm}",
+        })
+
+    # 整班漏抄：流水里压根没有这条记录
+    skipped = {
+        ("岸桥", "QC-105", "2026-09-28", "夜班"),
+        ("内集卡", "TRK-303", "2026-09-29", "夜班"),
+        # TRK-301 09-30 夜班改成两条手工记录，模拟重复提交后留最新
+        ("内集卡", "TRK-301", "2026-09-30", "夜班"),
+    }
+    # 单条记录的特殊口径：缺抄表人、超标、抄了但数值留空
+    overrides: dict[tuple[str, str, str, str], dict[str, Any]] = {
+        ("岸桥", "QC-102", "2026-09-29", "白班"): {"reader": None, "elec": 1800},
+        ("岸桥", "QC-104", "2026-09-29", "白班"): {"elec": 2600, "status": "异常偏高"},
+        ("岸桥", "QC-104", "2026-09-30", "夜班"): {"elec": 2520, "status": "异常偏高"},
+        ("场桥", "RTG-201", "2026-09-29", "白班"): {"elec": 760, "fuel": 168, "reader": "李文斌"},
+        ("场桥", "RTG-203", "2026-09-29", "夜班"): {"elec": 960, "status": "异常偏高"},
+        ("场桥", "RTG-204", "2026-09-30", "白班"): {"reader": None},
+        ("场桥", "RTG-205", "2026-09-30", "白班"): {"fuel": 235, "status": "异常偏高"},
+        ("场桥", "RTG-207", "2026-09-30", "晚班"): {"elec": 930, "status": "异常偏高"},
+        ("冷藏箱插座", "RCP-401", "2026-09-30", "夜班"): {"elec": None},
+        ("冷藏箱插座", "RCP-402", "2026-09-30", "白班"): {"elec": 195, "status": "异常偏高"},
+    }
+
+    def emit(cat: str, dev: str, di: int, day: str, day_i: int,
+             shift: str, elec: int | None, fuel: int | None) -> None:
+        key = (cat, dev, day, shift)
+        if key in skipped:
+            return
+        params: dict[str, Any] = {
+            "elec": elec + day_i * (20 if cat == "岸桥" else 10 if cat == "场桥" else 3)
+            if elec is not None else None,
+            "fuel": fuel + day_i * 2 if fuel is not None else None,
+            "reader": readers[(di + day_i) % len(readers)],
+            "status": "正常",
+        }
+        params.update(overrides.get(key, {}))
+        add(cat, dev, f"{day} {shift}", params["elec"], params["fuel"],
+            params["reader"], day, params.get("hm", submit_hm[shift]), params["status"])
+
+    for day_i, day in enumerate(days):
+        for i, dev in enumerate(qc):
+            for shift in shifts:
+                emit("岸桥", dev, i, day, day_i, shift, qc_elec[shift][i], None)
+        for i, dev in enumerate(rtg):
+            for shift in shifts:
+                emit("场桥", dev, i, day, day_i, shift, rtg_elec[shift][i], rtg_fuel[shift][i])
+        for i, dev in enumerate(trk):
+            for shift in shifts:
+                emit("内集卡", dev, i, day, day_i, shift, None, trk_fuel[shift][i])
+        for i, dev in enumerate(rcp):
+            for shift in shifts:
+                emit("冷藏箱插座", dev, i, day, day_i, shift, rcp_elec[shift][i], None)
+
+    # 场桥 RTG-201 09-29 白班：11:05 先交一版，15:00 又改一版（只保留 15:00 的最新值）
+    add("场桥", "RTG-201", "2026-09-29 白班", 700, 150, "张建国", "2026-09-29", "11:05",
+        code="ENER-DUP-01")
+    # 集卡 TRK-301 09-30 夜班：06:40 初报、07:10 更正
+    add("内集卡", "TRK-301", "2026-09-30 夜班", None, 120, "王海涛", "2026-09-30", "06:40",
+        code="ENER-DUP-02")
+    add("内集卡", "TRK-301", "2026-09-30 夜班", None, 128, "李文斌", "2026-09-30", "07:10",
+        status="已核实", code="ENER-DUP-03")
+
+    # 跨月历史记录：周 / 月账期看不到，季度、全部能看到
+    add("场桥", "RTG-202", "2026-08-28 白班", 620, 150, "王海涛", "2026-08-28", "15:00")
+    add("内集卡", "TRK-301", "2026-08-28 白班", None, 96, "赵晓燕", "2026-08-28", "15:00")
+    add("岸桥", "QC-101", "2026-07-15 白班", 1750, None, "张建国", "2026-07-15", "15:00")
+
+    # 记录时段缺失：无法归入任何班次，任何账期都单独圈出
+    add("内集卡", "TRK-304", "", None, 110, "李文斌", "2026-09-30", "12:00",
+        code="ENER-NOPERIOD")
+
+    return rows
+
+
 SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     "berth": [{'id': 1,
   'status': '空闲',
@@ -652,42 +803,7 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
   '堆存天数': '空箱堆存样例3',
   '出场日期': '2026-09-03',
   '空箱状态': '空箱堆存样例3'}],
-    "energy": [{'id': 1,
-  'status': '正常',
-  'pending': True,
-  'abnormal': False,
-  '记录编号': 'ENER-0001',
-  '设备类型': '能耗监测样例1',
-  '设备编号': 'ENER-0001',
-  '电耗度数': '能耗监测样例1',
-  '油耗升数': '能耗监测样例1',
-  '记录时段': '2026-09-01',
-  '抄表人员': '能耗监测样例1',
-  '能耗状态': '能耗监测样例1'},
- {'id': 2,
-  'status': '异常偏高',
-  'pending': True,
-  'abnormal': True,
-  '记录编号': 'ENER-0002',
-  '设备类型': '能耗监测样例2',
-  '设备编号': 'ENER-0002',
-  '电耗度数': '能耗监测样例2',
-  '油耗升数': '能耗监测样例2',
-  '记录时段': '2026-09-02',
-  '抄表人员': '能耗监测样例2',
-  '能耗状态': '能耗监测样例2'},
- {'id': 3,
-  'status': '异常偏低',
-  'pending': False,
-  'abnormal': False,
-  '记录编号': 'ENER-0003',
-  '设备类型': '能耗监测样例3',
-  '设备编号': 'ENER-0003',
-  '电耗度数': '能耗监测样例3',
-  '油耗升数': '能耗监测样例3',
-  '记录时段': '2026-09-03',
-  '抄表人员': '能耗监测样例3',
-  '能耗状态': '能耗监测样例3'}],
+    "energy": _build_energy_rows(),
     "safetycheck": [{'id': 1,
   'status': '待巡检',
   'pending': True,
